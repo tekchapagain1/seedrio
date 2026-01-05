@@ -52,6 +52,17 @@ async function getCachedVideos(accessToken) {
     return videos;
 }
 
+/**
+ * Invalidate video cache for a specific token
+ * Called after adding a magnet so new files appear faster
+ */
+function invalidateCache(accessToken) {
+    if (videoCache.has(accessToken)) {
+        videoCache.delete(accessToken);
+        console.log("🗑️ Video cache invalidated for token");
+    }
+}
+
 // ============================================
 // Catalog Handler - List Seedr Videos
 // ============================================
@@ -178,13 +189,17 @@ async function streamHandler(args, serverBaseUrl = "http://127.0.0.1:7000") {
 
             console.log("Found", torrentStreams.length, "Torrentio streams");
 
+            // Sort streams by seeders (desc) then quality (desc)
+            const sortedStreams = torrentioApi.sortStreams(torrentStreams);
+            console.log("Streams sorted by seeders and quality");
+
             // Also check if we already have this content in Seedr
             const existingVideos = await getCachedVideos(accessToken);
 
             const streams = [];
 
             // Map Torrentio streams to Seedr download streams
-            for (const stream of torrentStreams) {
+            for (const stream of sortedStreams) {
                 // Build the resolve URL that will handle downloading and streaming
                 const resolveParams = new URLSearchParams({
                     name: stream.filename || stream.title,
@@ -198,8 +213,8 @@ async function streamHandler(args, serverBaseUrl = "http://127.0.0.1:7000") {
 
                 streams.push({
                     url: resolveUrl,
-                    title: `⬇️ Seedr | ${streamTitle}`,
-                    name: "Seedr",
+                    title: streamTitle,
+                    name: "⬇️ Seedr",
                     behaviorHints: {
                         notWebReady: true
                     }
@@ -260,5 +275,6 @@ function formatFileSize(bytes) {
 module.exports = {
     manifest,
     catalogHandler,
-    streamHandler
+    streamHandler,
+    invalidateCache
 };

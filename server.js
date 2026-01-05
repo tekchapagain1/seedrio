@@ -3,6 +3,34 @@ const addon = require("./addon");
 const seedrApi = require("./seedrApi");
 
 const app = express();
+
+// ============================================
+// Deduplication: Track pending resolve requests
+// ============================================
+const pendingMagnets = new Map(); // key: infoHash, value: { promise, timestamp }
+const recentlyAdded = new Map();  // key: infoHash, value: { result, timestamp }
+const PENDING_TTL = 60 * 1000;    // 60 seconds for pending requests
+const RECENTLY_ADDED_TTL = 5 * 60 * 1000; // 5 minutes for recently added magnets
+
+/**
+ * Clean up expired entries from tracking maps
+ */
+function cleanupExpiredEntries() {
+    const now = Date.now();
+    for (const [hash, data] of pendingMagnets) {
+        if (now - data.timestamp > PENDING_TTL) {
+            pendingMagnets.delete(hash);
+        }
+    }
+    for (const [hash, data] of recentlyAdded) {
+        if (now - data.timestamp > RECENTLY_ADDED_TTL) {
+            recentlyAdded.delete(hash);
+        }
+    }
+}
+
+// Run cleanup every minute
+setInterval(cleanupExpiredEntries, 60 * 1000);
 const PORT = process.env.PORT || 7000;
 
 // Enable CORS for all routes
@@ -481,6 +509,7 @@ app.get("/:token/resolve/:infoHash", async (req, res) => {
     const { token, infoHash } = req.params;
     const { name, trackers, fileIdx } = req.query;
     const accessToken = decodeURIComponent(token);
+    const hashLower = infoHash.toLowerCase();
 
     console.log("============================================");
     console.log("🔄 Resolve request for infoHash:", infoHash);
@@ -488,32 +517,241 @@ app.get("/:token/resolve/:infoHash", async (req, res) => {
     console.log("============================================");
 
     try {
-        // Build magnet link from parameters
-        let magnet = `magnet:?xt=urn:btih:${infoHash}`;
-        if (name) {
-            magnet += `&dn=${encodeURIComponent(name)}`;
+        // First, check if the content already exists in Seedr and is ready to stream
+        try {
+            const videos = await seedrApi.getAllVideoFiles(accessToken);
+            const searchName = name ? name.toLowerCase().replace(/\.[^/.]+$/, "") : "";
+
+            // Search for matching video by name similarity
+            const matchingVideo = videos.find(video => {
+                const videoNameLower = video.name.toLowerCase().replace(/\.[^/.]+$/, "");
+                // Check for name match or if video path contains the search name
+                return videoNameLower.includes(searchName.substring(0, 20)) ||
+                    searchName.includes(videoNameLower.substring(0, 20)) ||
+                    video.path.toLowerCase().includes(searchName.substring(0, 20));
+            });
+
+            if (matchingVideo) {
+                console.log("✅ Found existing video in Seedr:", matchingVideo.name);
+                const streamData = await seedrApi.getStreamUrl(accessToken, matchingVideo.id);
+
+                if (streamData && streamData.url) {
+                    console.log("🎬 Redirecting to stream URL");
+                    return res.redirect(streamData.url);
+                }
+            }
+        } catch (checkError) {
+            console.log("⚠️ Could not check existing videos:", checkError.message);
         }
-        if (trackers) {
-            const trackerList = trackers.split(",");
-            for (const tracker of trackerList) {
-                magnet += `&tr=${encodeURIComponent(tracker)}`;
+
+        // Check 1: Was this magnet recently added? (handles duplicate clicks)
+        const recent = recentlyAdded.get(hashLower);
+        if (recent && Date.now() - recent.timestamp < RECENTLY_ADDED_TTL) {
+            console.log("⏭️ Skipping - magnet was recently added");
+            // Try to find the video again after it might have finished downloading
+            try {
+                const videos = await seedrApi.getAllVideoFiles(accessToken);
+                const searchName = name ? name.toLowerCase().replace(/\.[^/.]+$/, "") : "";
+
+                const matchingVideo = videos.find(video => {
+                    const videoNameLower = video.name.toLowerCase().replace(/\.[^/.]+$/, "");
+                    return videoNameLower.includes(searchName.substring(0, 20)) ||
+                        searchName.includes(videoNameLower.substring(0, 20));
+                });
+
+                if (matchingVideo) {
+                    const streamData = await seedrApi.getStreamUrl(accessToken, matchingVideo.id);
+                    if (streamData && streamData.url) {
+                        return res.redirect(streamData.url);
+                    }
+                }
+            } catch (e) { /* ignore */ }
+
+            // Show download status page
+            return res.send(getDownloadStatusPage(name || "Torrent", "recently_added"));
+        }
+
+        // Check 2: Is there already a pending request for this hash?
+        const pending = pendingMagnets.get(hashLower);
+        if (pending && Date.now() - pending.timestamp < PENDING_TTL) {
+            console.log("⏳ Deduplicating - waiting for existing request");
+            try {
+                await pending.promise;
+            } catch (error) {
+                console.log("⚠️ Original request failed, retrying...");
+                pendingMagnets.delete(hashLower);
             }
         }
 
-        console.log("📥 Adding magnet to Seedr...");
-        console.log("🧲 Magnet URL:", magnet);
+        // CRITICAL: Create a deferred promise and register it IMMEDIATELY (synchronously)
+        let resolvePromise, rejectPromise;
+        const deferredPromise = new Promise((resolve, reject) => {
+            resolvePromise = resolve;
+            rejectPromise = reject;
+        });
+        pendingMagnets.set(hashLower, { promise: deferredPromise, timestamp: Date.now() });
 
-        // Add magnet to Seedr
-        const result = await seedrApi.addMagnet(accessToken, magnet);
-        console.log("✅ Seedr response:", JSON.stringify(result, null, 2));
+        try {
+            // Check 3: Is this torrent already downloading in Seedr?
+            try {
+                const transfers = await seedrApi.getActiveTransfers(accessToken);
+                const existingTransfer = transfers.find(t =>
+                    t.hash?.toLowerCase() === hashLower ||
+                    (name && t.name?.toLowerCase().includes(name.toLowerCase().substring(0, 20)))
+                );
 
-        res.json({ success: true, result });
+                if (existingTransfer) {
+                    const progress = existingTransfer.progress || 0;
+                    console.log(`⏳ Already downloading: ${existingTransfer.name} (${progress}%)`);
+
+                    resolvePromise({ status: "already_downloading", transfer: existingTransfer });
+                    pendingMagnets.delete(hashLower);
+
+                    return res.send(getDownloadStatusPage(existingTransfer.name, "downloading", progress));
+                }
+            } catch (transferError) {
+                console.log("⚠️ Could not check active transfers:", transferError.message);
+            }
+
+            // Build magnet link from parameters
+            let magnet = `magnet:?xt=urn:btih:${infoHash}`;
+            if (name) {
+                magnet += `&dn=${encodeURIComponent(name)}`;
+            }
+            if (trackers) {
+                const trackerList = trackers.split(",");
+                for (const tracker of trackerList) {
+                    magnet += `&tr=${encodeURIComponent(tracker)}`;
+                }
+            }
+
+            console.log("📥 Adding magnet to Seedr...");
+
+            // Add magnet to Seedr
+            const result = await seedrApi.addMagnet(accessToken, magnet);
+            console.log("✅ Seedr response:", JSON.stringify(result, null, 2));
+
+            // Cache the successful result
+            recentlyAdded.set(hashLower, { result, timestamp: Date.now() });
+
+            // Invalidate video cache so new files appear faster
+            addon.invalidateCache(accessToken);
+
+            // Resolve the deferred promise for any waiting requests
+            resolvePromise(result);
+            pendingMagnets.delete(hashLower);
+
+            // Show download started page
+            return res.send(getDownloadStatusPage(name || "Torrent", "started"));
+
+        } catch (innerError) {
+            rejectPromise(innerError);
+            pendingMagnets.delete(hashLower);
+            throw innerError;
+        }
 
     } catch (error) {
         console.error("❌ Resolve error:", error.message);
-        res.status(500).json({ error: error.message });
+        pendingMagnets.delete(hashLower);
+        return res.send(getDownloadStatusPage(name || "Torrent", "error", 0, error.message));
     }
 });
+
+/**
+ * Generate a user-friendly download status page
+ */
+function getDownloadStatusPage(name, status, progress = 0, errorMessage = "") {
+    const statusMessages = {
+        "started": { icon: "📥", title: "Download Started", message: "The torrent has been added to Seedr. Check 'My Seedr Files' when complete." },
+        "downloading": { icon: "⏳", title: "Downloading...", message: `Currently downloading: ${progress}% complete` },
+        "recently_added": { icon: "⏳", title: "Download in Progress", message: "This torrent was recently added. Check 'My Seedr Files' when complete." },
+        "error": { icon: "❌", title: "Error", message: errorMessage || "Failed to add torrent" }
+    };
+
+    const info = statusMessages[status] || statusMessages.error;
+
+    return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Seedr - ${info.title}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #fff;
+        }
+        .container {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 90%;
+            text-align: center;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+        }
+        .icon { font-size: 4rem; margin-bottom: 20px; }
+        h1 { font-size: 1.8rem; margin-bottom: 10px; color: #4ade80; }
+        .name { 
+            color: #94a3b8; 
+            margin: 15px 0; 
+            font-size: 0.9rem;
+            word-break: break-word;
+            background: rgba(0,0,0,0.2);
+            padding: 10px;
+            border-radius: 8px;
+        }
+        .message { color: #fff; margin: 20px 0; line-height: 1.6; }
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4ade80, #22c55e);
+            transition: width 0.3s;
+        }
+        .tip {
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+            color: #94a3b8;
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">${info.icon}</div>
+        <h1>${info.title}</h1>
+        <div class="name">📁 ${name}</div>
+        ${status === "downloading" ? `
+        <div class="progress-bar">
+            <div class="progress-fill" style="width: ${progress}%"></div>
+        </div>
+        ` : ""}
+        <p class="message">${info.message}</p>
+        <div class="tip">
+            💡 <strong>Tip:</strong> Go to "My Seedr Files" in Stremio to find your downloaded content when it's ready.
+        </div>
+    </div>
+</body>
+</html>
+    `;
+}
 
 // ============================================
 // Root redirect to configure
