@@ -52,6 +52,32 @@ async function getSeriesStreams(imdbId) {
 }
 
 /**
+ * Get available streams for anime from Torrentio
+ * @param {string} kitsuId - Kitsu ID (e.g., "kitsu:12345" or "kitsu:12345:1:5" for episode)
+ * @returns {Promise<Array>}
+ */
+async function getAnimeStreams(kitsuId) {
+    try {
+        // ID format for anime in Stremio is "kitsu:12345" for series or "kitsu:12345:1:5" for S1:E5
+        console.log("Fetching anime streams for:", kitsuId);
+
+        // Torrentio uses the anime endpoint for kitsu IDs
+        const response = await axios.get(`${TORRENTIO_BASE_URL}/stream/anime/${kitsuId}.json`, {
+            timeout: 10000
+        });
+
+        if (!response.data || !response.data.streams) {
+            return [];
+        }
+
+        return response.data.streams.map(stream => parseStream(stream)).filter(s => s !== null);
+    } catch (error) {
+        console.error("Error fetching Torrentio anime streams:", error.message);
+        return [];
+    }
+}
+
+/**
  * Parse a Torrentio stream object into our format
  * @param {Object} stream - Torrentio stream object
  * @returns {Object|null}
@@ -184,6 +210,7 @@ function formatStreamTitle(stream) {
 module.exports = {
     getMovieStreams,
     getSeriesStreams,
+    getAnimeStreams,
     buildMagnet,
     formatStreamTitle,
     parseStream

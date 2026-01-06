@@ -10,7 +10,7 @@ const manifest = {
     name: "Seedr Cloud Player",
     description: "Stream videos from your Seedr cloud storage account. Supports downloading torrents via Torrentio and streaming from Seedr.",
     resources: ["catalog", "stream"],
-    types: ["movie", "series", "channel", "tv", "other"],
+    types: ["movie", "series", "channel", "tv", "anime", "other"],
     catalogs: [
         {
             type: "other",
@@ -24,7 +24,7 @@ const manifest = {
             name: "Seedr Downloads"
         }
     ],
-    idPrefixes: ["seedr:", "tt"],
+    idPrefixes: ["seedr:", "tt", "kitsu:"],
     behaviorHints: {
         configurable: true,
         configurationRequired: false
@@ -174,14 +174,22 @@ async function streamHandler(args, serverBaseUrl = "http://127.0.0.1:7000") {
     }
 
     // Handle movie/series streams via Torrentio
-    const isSeries = args.type === "series" || args.id.includes(":");
+    // For anime with kitsu: IDs, we need to handle episode format: kitsu:12345:1:5 (kitsu:animeId:season:episode)
+    const isAnime = args.type === "anime" || args.id.startsWith("kitsu:");
+    const isSeries = args.type === "series" || (args.id.includes(":") && !isAnime) || (isAnime && args.id.split(":").length > 2);
 
-    if ((args.type === "movie" || args.type === "series" || args.type === "tv" || args.type === "channel" || args.type === "anime") && args.id.startsWith("tt")) {
+    // Support both IMDB (tt) and Kitsu (kitsu:) IDs
+    const isValidId = args.id.startsWith("tt") || args.id.startsWith("kitsu:");
+
+    if ((args.type === "movie" || args.type === "series" || args.type === "tv" || args.type === "channel" || args.type === "anime") && isValidId) {
         try {
             console.log(`Fetching Torrentio streams for ${args.type}: ${args.id}`);
 
             let torrentStreams = [];
-            if (isSeries) {
+            if (isAnime) {
+                // Anime uses kitsu: IDs - Torrentio handles these with the anime endpoint
+                torrentStreams = await torrentioApi.getAnimeStreams(args.id);
+            } else if (isSeries) {
                 torrentStreams = await torrentioApi.getSeriesStreams(args.id);
             } else {
                 torrentStreams = await torrentioApi.getMovieStreams(args.id);
