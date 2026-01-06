@@ -3,35 +3,8 @@ const addon = require("./addon");
 const seedrApi = require("./seedrApi");
 
 const app = express();
-
-// ============================================
-// Deduplication: Track pending resolve requests
-// ============================================
-const pendingMagnets = new Map(); // key: infoHash, value: { promise, timestamp }
-const recentlyAdded = new Map();  // key: infoHash, value: { result, timestamp }
-const PENDING_TTL = 60 * 1000;    // 60 seconds for pending requests
-const RECENTLY_ADDED_TTL = 5 * 60 * 1000; // 5 minutes for recently added magnets
-
-/**
- * Clean up expired entries from tracking maps
- */
-function cleanupExpiredEntries() {
-    const now = Date.now();
-    for (const [hash, data] of pendingMagnets) {
-        if (now - data.timestamp > PENDING_TTL) {
-            pendingMagnets.delete(hash);
-        }
-    }
-    for (const [hash, data] of recentlyAdded) {
-        if (now - data.timestamp > RECENTLY_ADDED_TTL) {
-            recentlyAdded.delete(hash);
-        }
-    }
-}
-
-// Run cleanup every minute
-setInterval(cleanupExpiredEntries, 60 * 1000);
-const PORT = process.env.PORT || 7000;
+app.set('trust proxy', true);
+const PORT = process.env.PORT || 8000;
 
 // Enable CORS for all routes
 app.use((req, res, next) => {
@@ -505,116 +478,150 @@ app.get("/:token/stream/:type/:id.json", async (req, res) => {
 // ============================================
 // Resolve Endpoint - Download torrent and redirect to stream
 // ============================================
+// Keep track of active processing to prevent race conditions
+const processingLocks = new Set();
+// Cache for resolved stream URLs to prevent repetitive API calls
+const resolveCache = new Map();
+const RESOLVE_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
 app.get("/:token/resolve/:infoHash", async (req, res) => {
     const { token, infoHash } = req.params;
-    const { name, trackers, fileIdx } = req.query;
+    const { name, trackers, fileIdx, torrentFile } = req.query;
     const accessToken = decodeURIComponent(token);
-    const hashLower = infoHash.toLowerCase();
+
+    // Check cache first
+    if (resolveCache.has(infoHash)) {
+        const cached = resolveCache.get(infoHash);
+        if (Date.now() - cached.timestamp < RESOLVE_CACHE_TTL) {
+            console.log(`⚡ Using cached stream URL for ${infoHash}`);
+            return res.redirect(307, cached.url);
+        } else {
+            resolveCache.delete(infoHash);
+        }
+    }
 
     console.log("============================================");
     console.log("🔄 Resolve request for infoHash:", infoHash);
     console.log("   Name:", name);
+    console.log("   Type:", torrentFile ? "Torrent File" : "Magnet Link");
     console.log("============================================");
 
-    try {
-        // First, check if the content already exists in Seedr and is ready to stream
-        try {
-            const videos = await seedrApi.getAllVideoFiles(accessToken);
-            const searchName = name ? name.toLowerCase().replace(/\.[^/.]+$/, "") : "";
-
-            // Search for matching video by name similarity
-            const matchingVideo = videos.find(video => {
-                const videoNameLower = video.name.toLowerCase().replace(/\.[^/.]+$/, "");
-                // Check for name match or if video path contains the search name
-                return videoNameLower.includes(searchName.substring(0, 20)) ||
-                    searchName.includes(videoNameLower.substring(0, 20)) ||
-                    video.path.toLowerCase().includes(searchName.substring(0, 20));
-            });
-
-            if (matchingVideo) {
-                console.log("✅ Found existing video in Seedr:", matchingVideo.name);
-                const streamData = await seedrApi.getStreamUrl(accessToken, matchingVideo.id);
-
-                if (streamData && streamData.url) {
-                    console.log("🎬 Redirecting to stream URL");
-                    return res.redirect(streamData.url);
-                }
-            }
-        } catch (checkError) {
-            console.log("⚠️ Could not check existing videos:", checkError.message);
+    // Wait if this infoHash is already being processed (simple busy-wait or just join)
+    // Since we can't easily "join" the other request's specific state in this architecture without complex event emitters,
+    // we will just wait until the lock is released, then proceed with checks (which should catch the newly added transfer).
+    if (processingLocks.has(infoHash)) {
+        console.log("⏳ Another request is processing this infoHash. Waiting for lock release...");
+        let waitTime = 0;
+        while (processingLocks.has(infoHash) && waitTime < 30000) { // 30s max wait
+            await new Promise(r => setTimeout(r, 1000));
+            waitTime += 1000;
         }
+        console.log("🔓 Lock released (or timed out). Proceeding...");
+    }
 
-        // Check 1: Was this magnet recently added? (handles duplicate clicks)
-        const recent = recentlyAdded.get(hashLower);
-        if (recent && Date.now() - recent.timestamp < RECENTLY_ADDED_TTL) {
-            console.log("⏭️ Skipping - magnet was recently added");
-            // Try to find the video again after it might have finished downloading
-            try {
+    try {
+        // Poll for completion (5 minute timeout, 3 second intervals)
+        const maxAttempts = 100; // 100 * 3s = 5 minutes
+        const pollInterval = 3000;
+        let attempts = 0;
+
+        const pollForCompletion = async () => {
+            console.log("⏳ Waiting for download to complete...");
+            let lastProgress = -1;
+
+            while (attempts < maxAttempts) {
+                attempts++;
+                await new Promise(resolve => setTimeout(resolve, pollInterval));
+
+                // Check transfers for progress
+                let transfers = await seedrApi.getActiveTransfers(accessToken);
+                const transfer = transfers.find(t =>
+                    t.name && name && t.name.toLowerCase().includes(name.toLowerCase().substring(0, 20))
+                );
+
+                if (transfer) {
+                    const progress = transfer.progress || 0;
+                    if (progress !== lastProgress) {
+                        console.log(`   Progress: ${progress}% (attempt ${attempts}/${maxAttempts})`);
+                        lastProgress = progress;
+                    }
+
+                    if (progress >= 100) {
+                        // Download complete - wait a moment for file to be moved to folder
+                        // If it stays at 100% without disappearing from transfers, it might be processing
+                        if (attempts % 5 === 0) console.log("   (Stuck at 100%? waiting for file processing...)");
+                    }
+                } else {
+                    // If no transfer found, it might be done or failed.
+                    // We continue to check videos.
+                }
+
+                // Check if file is now in videos
                 const videos = await seedrApi.getAllVideoFiles(accessToken);
-                const searchName = name ? name.toLowerCase().replace(/\.[^/.]+$/, "") : "";
 
-                const matchingVideo = videos.find(video => {
-                    const videoNameLower = video.name.toLowerCase().replace(/\.[^/.]+$/, "");
-                    return videoNameLower.includes(searchName.substring(0, 20)) ||
-                        searchName.includes(videoNameLower.substring(0, 20));
+                // DEBUG: Log first few videos found to see what we are comparing against
+                if (attempts === 1 || attempts % 10 === 0) {
+                    // console.log("   Current videos in specific folder:", videos.map(v => v.name).slice(0, 3));
+                }
+
+                const matchingVideo = videos.find(v => {
+                    const videoNameLower = v.name.toLowerCase();
+                    const searchName = (name || "").toLowerCase();
+                    // Try more flexible matching
+                    // 1. Exact substring match (first 20 chars)
+                    const match1 = videoNameLower.includes(searchName.substring(0, 20));
+                    // 2. Reverse match (search name includes video name - careful with short names)
+                    const cleanVideoName = videoNameLower.replace(/\.[^/.]+$/, ""); // remove extension
+                    const match2 = searchName.includes(cleanVideoName.substring(0, 20));
+
+                    return match1 || match2;
                 });
 
                 if (matchingVideo) {
+                    console.log("✅ Download complete:", matchingVideo.name);
                     const streamData = await seedrApi.getStreamUrl(accessToken, matchingVideo.id);
                     if (streamData && streamData.url) {
-                        return res.redirect(streamData.url);
+                        console.log("🎬 Redirecting to stream URL");
+                        // Cache the successful result
+                        resolveCache.set(infoHash, {
+                            url: streamData.url,
+                            timestamp: Date.now()
+                        });
+                        return res.redirect(307, streamData.url);
+                    }
+                } else if (!transfer && attempts > 5) {
+                    // If no active transfer and no video found after a few attempts, 
+                    // maybe look for ANY video in the top folder if we just added one?
+                    // Or look for the specific folder we added to?
+                    // For now, just log that we haven't found it yet.
+                    if (attempts % 5 === 0) {
+                        console.log(`   ❓ No transfer and no matching video found yet for "${name}"`);
+                        // DEBUG: Inspect what IS there
+                        if (videos.length > 0) {
+                            console.log(`      Available videos: ${videos.map(v => v.name).join(", ")}`);
+                        } else {
+                            console.log("      No videos found in account.");
+                        }
                     }
                 }
-            } catch (e) { /* ignore */ }
-
-            // Show download status page
-            return res.send(getDownloadStatusPage(name || "Torrent", "recently_added"));
-        }
-
-        // Check 2: Is there already a pending request for this hash?
-        const pending = pendingMagnets.get(hashLower);
-        if (pending && Date.now() - pending.timestamp < PENDING_TTL) {
-            console.log("⏳ Deduplicating - waiting for existing request");
-            try {
-                await pending.promise;
-            } catch (error) {
-                console.log("⚠️ Original request failed, retrying...");
-                pendingMagnets.delete(hashLower);
-            }
-        }
-
-        // CRITICAL: Create a deferred promise and register it IMMEDIATELY (synchronously)
-        let resolvePromise, rejectPromise;
-        const deferredPromise = new Promise((resolve, reject) => {
-            resolvePromise = resolve;
-            rejectPromise = reject;
-        });
-        pendingMagnets.set(hashLower, { promise: deferredPromise, timestamp: Date.now() });
-
-        try {
-            // Check 3: Is this torrent already downloading in Seedr?
-            try {
-                const transfers = await seedrApi.getActiveTransfers(accessToken);
-                const existingTransfer = transfers.find(t =>
-                    t.hash?.toLowerCase() === hashLower ||
-                    (name && t.name?.toLowerCase().includes(name.toLowerCase().substring(0, 20)))
-                );
-
-                if (existingTransfer) {
-                    const progress = existingTransfer.progress || 0;
-                    console.log(`⏳ Already downloading: ${existingTransfer.name} (${progress}%)`);
-
-                    resolvePromise({ status: "already_downloading", transfer: existingTransfer });
-                    pendingMagnets.delete(hashLower);
-
-                    return res.send(getDownloadStatusPage(existingTransfer.name, "downloading", progress));
-                }
-            } catch (transferError) {
-                console.log("⚠️ Could not check active transfers:", transferError.message);
             }
 
+            // Timeout reached
+            console.log("⏰ Timeout waiting for download");
+            return res.status(408).json({
+                error: "Download timeout",
+                message: "The download is taking longer than expected. Please check Seedr Downloads catalog and try again."
+            });
+        };
+
+        // Determine if we're using a torrent file or magnet link
+        let isTorrentFile = !!torrentFile;
+        let magnet = null;
+        let torrentData = null;
+
+        if (!isTorrentFile) {
             // Build magnet link from parameters
-            let magnet = `magnet:?xt=urn:btih:${infoHash}`;
+            magnet = `magnet:?xt=urn:btih:${infoHash}`;
             if (name) {
                 magnet += `&dn=${encodeURIComponent(name)}`;
             }
@@ -624,134 +631,174 @@ app.get("/:token/resolve/:infoHash", async (req, res) => {
                     magnet += `&tr=${encodeURIComponent(tracker)}`;
                 }
             }
-
-            console.log("📥 Adding magnet to Seedr...");
-
-            // Add magnet to Seedr
-            const result = await seedrApi.addMagnet(accessToken, magnet);
-            console.log("✅ Seedr response:", JSON.stringify(result, null, 2));
-
-            // Cache the successful result
-            recentlyAdded.set(hashLower, { result, timestamp: Date.now() });
-
-            // Invalidate video cache so new files appear faster
-            addon.invalidateCache(accessToken);
-
-            // Resolve the deferred promise for any waiting requests
-            resolvePromise(result);
-            pendingMagnets.delete(hashLower);
-
-            // Show download started page
-            return res.send(getDownloadStatusPage(name || "Torrent", "started"));
-
-        } catch (innerError) {
-            rejectPromise(innerError);
-            pendingMagnets.delete(hashLower);
-            throw innerError;
+        } else {
+            // Torrent file is base64 encoded in the query
+            torrentData = decodeURIComponent(torrentFile);
         }
+
+        console.log("🔒 Acquiring processing lock...");
+        processingLocks.add(infoHash);
+
+        try {
+            // Step 1: Check if folder exists for this info_hash (cached downloads)
+            console.log("📁 Looking for existing folder...");
+            let targetFolder = await seedrApi.getFolderByName(accessToken, infoHash);
+
+            if (targetFolder) {
+                console.log("✅ Using existing folder:", targetFolder.id);
+
+                // Check if torrent is already downloading or completed in this folder
+                const folderContent = await seedrApi.getFolder(accessToken, targetFolder.id);
+
+                if (folderContent.folders && folderContent.folders.length > 0) {
+                    console.log("✅ Torrent already completed in this folder");
+                    // Get files from the first subfolder (completed torrent)
+                    const completedFolder = folderContent.folders[0];
+                    const completedContent = await seedrApi.getFolder(accessToken, completedFolder.id);
+
+                    if (completedContent.files && completedContent.files.length > 0) {
+                        // Find a playable video file
+                        const videoFile = completedContent.files.find(f => f.play_video);
+                        if (videoFile) {
+                            console.log("🎬 Found playable file:", videoFile.name);
+                            const streamData = await seedrApi.getStreamUrl(accessToken, videoFile.folder_file_id);
+                            if (streamData && streamData.url) {
+                                console.log("🎬 Redirecting to stream URL");
+                                return res.redirect(307, streamData.url);
+                            }
+                        }
+                    }
+                } else if (folderContent.torrents && folderContent.torrents.length > 0) {
+                    console.log("⏳ Torrent already downloading in this folder, waiting for completion...");
+                    // Don't add again - skip to polling
+                    return pollForCompletion();
+                }
+            }
+
+            // Step 1.5: Check if torrent is already in active transfers (prevent duplicate additions)
+            console.log("🔍 Checking for existing transfers...");
+            const activeTransfers = await seedrApi.getActiveTransfers(accessToken);
+            const existingTransfer = activeTransfers.find(t => {
+                if (!t.name || !name) return false;
+                const tNameLower = t.name.toLowerCase();
+                const searchName = name.toLowerCase();
+                return tNameLower.includes(searchName.substring(0, 30)) ||
+                    tNameLower.includes(infoHash.substring(0, 16));
+            });
+
+            if (existingTransfer) {
+                console.log("⏳ Torrent already in transfer queue, waiting for completion...");
+                console.log("   Current progress:", existingTransfer.progress || 0, "%");
+                // Skip adding - go straight to polling
+                attempts = 0; // Reset attempts counter
+                return pollForCompletion();
+            }
+
+            // Step 1.8: Check if the file is already completed and in the library 
+            // (Previous check only looked for folder named infoHash, but Magnet links created folders with torrent name)
+            console.log("🔍 Checking for existing completed files...");
+            const allVideos = await seedrApi.getAllVideoFiles(accessToken);
+            const existingVideo = allVideos.find(v => {
+                const videoNameLower = v.name.toLowerCase();
+                const searchName = (name || "").toLowerCase();
+                const match1 = videoNameLower.includes(searchName.substring(0, 20));
+                const cleanVideoName = videoNameLower.replace(/\.[^/.]+$/, "");
+                const match2 = searchName.includes(cleanVideoName.substring(0, 20));
+                return match1 || match2;
+            });
+
+            if (existingVideo) {
+                console.log("✅ Match found in library:", existingVideo.name);
+                const streamData = await seedrApi.getStreamUrl(accessToken, existingVideo.id);
+                if (streamData && streamData.url) {
+                    console.log("🎬 Redirecting to stream URL (Cached)");
+                    resolveCache.set(infoHash, {
+                        url: streamData.url,
+                        timestamp: Date.now()
+                    });
+                    return res.redirect(307, streamData.url);
+                }
+            }
+
+            // Step 2: Add torrent (magnet link or file) to root
+            let addResult;
+            let retryCount = 0;
+            const maxRetries = 1;
+
+            while (retryCount <= maxRetries) {
+                try {
+                    if (isTorrentFile) {
+                        console.log(`📥 Adding torrent file to Seedr (Attempt ${retryCount + 1})...`);
+                        addResult = await seedrApi.addTorrentFile(accessToken, torrentData, name || `torrent-${infoHash}.torrent`);
+                    } else {
+                        console.log(`📥 Adding magnet to Seedr (Attempt ${retryCount + 1})...`);
+                        addResult = await seedrApi.addMagnet(accessToken, magnet, -1);
+                    }
+
+                    // Check for "soft" failures that are actually successes-with-conditions in API (result: "queue_full...")
+                    // But user wants to CLEAR if this happens, so treat as failure needing clear
+                    if (addResult.result === "queue_full_added_to_wishlist" || addResult.result === "not_enough_space_added_to_wishlist") {
+                        throw new Error(`Space/Queue full (code: ${addResult.result})`);
+                    }
+
+                    // If we get here and result is true/success, we are done
+                    if (addResult.result === true || addResult.result === "success") {
+                        console.log("✅ Torrent added to active downloads");
+                        break;
+                    } else {
+                        // Unknown success code, but assume success
+                        console.log("✅ Torrent added successfully (code: " + addResult.result + ")");
+                        break;
+                    }
+
+                } catch (error) {
+                    console.error(`❌ Attempt ${retryCount + 1} failed:`, error.message);
+
+                    // If last retry or not a space issue (optional check, but good for safety), rethrow
+                    // Actually, we want to clear ONLY on space/queue issues or if we just want to force clear on any error (risky)
+                    // User said: "if no space is available then clear all"
+                    // So we check for keywords in error or the specific codes above
+                    const isSpaceIssue = error.message.includes("not_enough_space") ||
+                        error.message.includes("queue_full") ||
+                        error.message.includes("storage_full"); // Add more keywords if needed
+
+                    if (retryCount < maxRetries && isSpaceIssue) {
+                        console.log("⚠️  Space/Queue limit reached. Clearing Seedr account as requested...");
+
+                        // If it was added to wishlist during the failed attempt (soft fail), delete it first to be clean
+                        if (addResult && addResult.wt && addResult.wt.id) {
+                            await seedrApi.deleteFromWishlist(accessToken, addResult.wt.id);
+                        }
+
+                        const clearResult = await seedrApi.clearAccount(accessToken);
+                        if (!clearResult.result) {
+                            console.error("❌ Failed to clear account:", clearResult.error);
+                            // If clear fails, we probably can't add anyway, but let loop continue to fail naturally or try
+                        }
+                        retryCount++;
+                        // Continue to next iteration (retry)
+                    } else {
+                        // No more retries or not a space issue
+                        return res.status(507).json({
+                            error: "Storage full or queue full",
+                            message: "Not enough space in Seedr. Attempted to clear account but failed or space still insufficient."
+                        });
+                    }
+                }
+            }
+        } finally {
+            console.log("🔓 Releasing processing lock...");
+            processingLocks.delete(infoHash);
+        }
+
+        // Start polling
+        await pollForCompletion();
 
     } catch (error) {
         console.error("❌ Resolve error:", error.message);
-        pendingMagnets.delete(hashLower);
-        return res.send(getDownloadStatusPage(name || "Torrent", "error", 0, error.message));
+        res.status(500).json({ error: error.message });
     }
 });
-
-/**
- * Generate a user-friendly download status page
- */
-function getDownloadStatusPage(name, status, progress = 0, errorMessage = "") {
-    const statusMessages = {
-        "started": { icon: "📥", title: "Download Started", message: "The torrent has been added to Seedr. Check 'My Seedr Files' when complete." },
-        "downloading": { icon: "⏳", title: "Downloading...", message: `Currently downloading: ${progress}% complete` },
-        "recently_added": { icon: "⏳", title: "Download in Progress", message: "This torrent was recently added. Check 'My Seedr Files' when complete." },
-        "error": { icon: "❌", title: "Error", message: errorMessage || "Failed to add torrent" }
-    };
-
-    const info = statusMessages[status] || statusMessages.error;
-
-    return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Seedr - ${info.title}</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            color: #fff;
-        }
-        .container {
-            background: rgba(255,255,255,0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 40px;
-            max-width: 500px;
-            width: 90%;
-            text-align: center;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
-        }
-        .icon { font-size: 4rem; margin-bottom: 20px; }
-        h1 { font-size: 1.8rem; margin-bottom: 10px; color: #4ade80; }
-        .name { 
-            color: #94a3b8; 
-            margin: 15px 0; 
-            font-size: 0.9rem;
-            word-break: break-word;
-            background: rgba(0,0,0,0.2);
-            padding: 10px;
-            border-radius: 8px;
-        }
-        .message { color: #fff; margin: 20px 0; line-height: 1.6; }
-        .progress-bar {
-            width: 100%;
-            height: 20px;
-            background: rgba(0,0,0,0.3);
-            border-radius: 10px;
-            overflow: hidden;
-            margin: 20px 0;
-        }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #4ade80, #22c55e);
-            transition: width 0.3s;
-        }
-        .tip {
-            margin-top: 20px;
-            padding: 15px;
-            background: rgba(0,0,0,0.2);
-            border-radius: 8px;
-            color: #94a3b8;
-            font-size: 0.85rem;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="icon">${info.icon}</div>
-        <h1>${info.title}</h1>
-        <div class="name">📁 ${name}</div>
-        ${status === "downloading" ? `
-        <div class="progress-bar">
-            <div class="progress-fill" style="width: ${progress}%"></div>
-        </div>
-        ` : ""}
-        <p class="message">${info.message}</p>
-        <div class="tip">
-            💡 <strong>Tip:</strong> Go to "My Seedr Files" in Stremio to find your downloaded content when it's ready.
-        </div>
-    </div>
-</body>
-</html>
-    `;
-}
 
 // ============================================
 // Root redirect to configure

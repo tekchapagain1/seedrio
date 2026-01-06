@@ -10,12 +10,13 @@ const manifest = {
     name: "Seedr Cloud Player",
     description: "Stream videos from your Seedr cloud storage account. Supports downloading torrents via Torrentio and streaming from Seedr.",
     resources: ["catalog", "stream"],
-    types: ["other", "movie"],
+    types: ["movie", "series", "channel", "tv", "other"],
     catalogs: [
         {
             type: "other",
             id: "seedr-files",
-            name: "My Seedr Files"
+            name: "My Seedr Files",
+            extra: [{ name: "search", isRequired: false }]
         },
         {
             type: "other",
@@ -52,17 +53,6 @@ async function getCachedVideos(accessToken) {
     return videos;
 }
 
-/**
- * Invalidate video cache for a specific token
- * Called after adding a magnet so new files appear faster
- */
-function invalidateCache(accessToken) {
-    if (videoCache.has(accessToken)) {
-        videoCache.delete(accessToken);
-        console.log("🗑️ Video cache invalidated for token");
-    }
-}
-
 // ============================================
 // Catalog Handler - List Seedr Videos
 // ============================================
@@ -81,8 +71,15 @@ async function catalogHandler(args) {
     if (args.type === "other" && args.id === "seedr-files") {
         try {
             const videos = await getCachedVideos(accessToken);
+            let filteredVideos = videos;
 
-            const metas = videos.map(video => ({
+            // Handle search
+            if (args.extra && args.extra.search) {
+                const query = args.extra.search.toLowerCase();
+                filteredVideos = videos.filter(v => v.name.toLowerCase().includes(query));
+            }
+
+            const metas = filteredVideos.map(video => ({
                 id: `seedr:${video.id}`,
                 type: "other",
                 name: video.name.replace(/\.[^/.]+$/, ""), // Remove file extension
@@ -176,11 +173,19 @@ async function streamHandler(args, serverBaseUrl = "http://127.0.0.1:7000") {
         return { streams: [] };
     }
 
-    // Handle movie streams via Torrentio (IMDB ID format: tt1234567)
-    if (args.type === "movie" && args.id.startsWith("tt")) {
+    // Handle movie/series streams via Torrentio
+    const isSeries = args.type === "series" || args.id.includes(":");
+
+    if ((args.type === "movie" || args.type === "series" || args.type === "tv" || args.type === "channel" || args.type === "anime") && args.id.startsWith("tt")) {
         try {
-            console.log("Fetching Torrentio streams for movie:", args.id);
-            const torrentStreams = await torrentioApi.getMovieStreams(args.id);
+            console.log(`Fetching Torrentio streams for ${args.type}: ${args.id}`);
+
+            let torrentStreams = [];
+            if (isSeries) {
+                torrentStreams = await torrentioApi.getSeriesStreams(args.id);
+            } else {
+                torrentStreams = await torrentioApi.getMovieStreams(args.id);
+            }
 
             if (!torrentStreams || torrentStreams.length === 0) {
                 console.log("No Torrentio streams found for:", args.id);
@@ -189,9 +194,11 @@ async function streamHandler(args, serverBaseUrl = "http://127.0.0.1:7000") {
 
             console.log("Found", torrentStreams.length, "Torrentio streams");
 
-            // Sort streams by seeders (desc) then quality (desc)
-            const sortedStreams = torrentioApi.sortStreams(torrentStreams);
-            console.log("Streams sorted by seeders and quality");
+            // Sort by seeders (descending)
+            torrentStreams.sort((a, b) => (b.seeders || 0) - (a.seeders || 0));
+
+            // For series, filter/match specific episode if possible?
+            // Torrentio already returns streams for the specific episode ID "tt:s:e" passed to it.
 
             // Also check if we already have this content in Seedr
             const existingVideos = await getCachedVideos(accessToken);
@@ -199,7 +206,7 @@ async function streamHandler(args, serverBaseUrl = "http://127.0.0.1:7000") {
             const streams = [];
 
             // Map Torrentio streams to Seedr download streams
-            for (const stream of sortedStreams) {
+            for (const stream of torrentStreams) {
                 // Build the resolve URL that will handle downloading and streaming
                 const resolveParams = new URLSearchParams({
                     name: stream.filename || stream.title,
@@ -213,8 +220,8 @@ async function streamHandler(args, serverBaseUrl = "http://127.0.0.1:7000") {
 
                 streams.push({
                     url: resolveUrl,
-                    title: streamTitle,
-                    name: "⬇️ Seedr",
+                    title: `${streamTitle}`,
+                    name: "Seedr",
                     behaviorHints: {
                         notWebReady: true
                     }
@@ -224,12 +231,14 @@ async function streamHandler(args, serverBaseUrl = "http://127.0.0.1:7000") {
             // Check if any matching file already exists in Seedr (by filename similarity)
             for (const video of existingVideos) {
                 const videoNameLower = video.name.toLowerCase();
-                // Check if this video might match the movie
+                // Check if this video might match the movie/episode
                 for (const stream of torrentStreams) {
                     const streamNameLower = (stream.filename || stream.title).toLowerCase();
                     // Simple matching - could be improved
+                    // For series, we might need stricter matching (SxxExx)
                     if (videoNameLower.includes(args.id.replace("tt", "")) ||
                         streamNameLower.includes(videoNameLower.replace(/\.[^/.]+$/, ""))) {
+
                         try {
                             const streamData = await seedrApi.getStreamUrl(accessToken, video.id);
                             if (streamData && streamData.url) {
@@ -252,7 +261,7 @@ async function streamHandler(args, serverBaseUrl = "http://127.0.0.1:7000") {
 
             return { streams };
         } catch (error) {
-            console.error("Error handling movie stream:", error.message);
+            console.error("Error handling movie/series stream:", error.message);
             return { streams: [] };
         }
     }
@@ -275,6 +284,5 @@ function formatFileSize(bytes) {
 module.exports = {
     manifest,
     catalogHandler,
-    streamHandler,
-    invalidateCache
+    streamHandler
 };

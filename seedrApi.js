@@ -208,6 +208,64 @@ async function deleteFolder(accessToken, folderId) {
     return response.data;
 }
 
+/**
+ * Delete all content from Seedr (folders, files, and active transfers)
+ * @param {string} accessToken - The access token
+ * @returns {Promise<{result: boolean, deleted: number, message: string}>}
+ */
+async function deleteAllContent(accessToken) {
+    try {
+        const rootFolder = await getFolder(accessToken, null);
+        const deleteItems = [];
+
+        // Queue all folders for deletion
+        if (rootFolder.folders && rootFolder.folders.length > 0) {
+            for (const folder of rootFolder.folders) {
+                deleteItems.push({ type: "folder", id: folder.id });
+            }
+        }
+
+        // Queue all files for deletion
+        if (rootFolder.files && rootFolder.files.length > 0) {
+            for (const file of rootFolder.files) {
+                deleteItems.push({ type: "file", id: file.folder_file_id });
+            }
+        }
+
+        // Queue all active transfers for deletion
+        if (rootFolder.transfers && rootFolder.transfers.length > 0) {
+            for (const transfer of rootFolder.transfers) {
+                deleteItems.push({ type: "torrent", id: transfer.id });
+            }
+        }
+
+        if (deleteItems.length === 0) {
+            return { result: true, deleted: 0, message: "Nothing to delete" };
+        }
+
+        // Delete all items in one API call
+        const formData = new URLSearchParams();
+        formData.append("access_token", accessToken);
+        formData.append("func", "delete");
+        formData.append("delete_arr", JSON.stringify(deleteItems));
+
+        const response = await axios.post(`${SEEDR_BASE_URL}/oauth_test/resource.php`, formData, {
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+        });
+
+        return { 
+            result: response.data.result || true, 
+            deleted: deleteItems.length, 
+            message: `Deleted ${deleteItems.length} items` 
+        };
+    } catch (error) {
+        console.error("Error deleting all content:", error.message);
+        throw error;
+    }
+}
+
 module.exports = {
     getDeviceCode,
     pollForToken,
@@ -217,5 +275,6 @@ module.exports = {
     getUserInfo,
     addMagnet,
     getActiveTransfers,
-    deleteFolder
+    deleteFolder,
+    deleteAllContent
 };
