@@ -11,12 +11,12 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    
+
     // Convert headers to lowercase for consistent checking
     if (req.method === 'OPTIONS') {
         return res.status(200).end();
     }
-    
+
     next();
 });
 
@@ -817,18 +817,22 @@ app.get("/", (req, res) => {
 // ============================================
 // Start Server
 // ============================================
-app.listen(PORT, () => {
-    console.log("============================================");
-    console.log("🎬 Seedr Cloud Player for Stremio");
-    console.log("============================================");
-    console.log("");
-    console.log("📍 Server running at: http://127.0.0.1:" + PORT);
-    console.log("");
-    console.log("🔧 To connect your Seedr account:");
-    console.log("   1. Open: http://127.0.0.1:" + PORT + "/configure");
-    console.log("   2. Follow the on-screen instructions");
-    console.log("   3. Click 'Install in Stremio' when done");
-    console.log("");
-    console.log("Press Ctrl+C to stop the server");
-    console.log("============================================");
-});
+if (require.main === module) {
+    app.listen(PORT, () => {
+        console.log("============================================");
+        console.log("🎬 Seedr Cloud Player for Stremio");
+        console.log("============================================");
+        console.log("");
+        console.log("📍 Server running at: http://127.0.0.1:" + PORT);
+        console.log("");
+        console.log("🔧 To connect your Seedr account:");
+        console.log("   1. Open: http://127.0.0.1:" + PORT + "/configure");
+        console.log("   2. Follow the on-screen instructions");
+        console.log("   3. Click 'Install in Stremio' when done");
+        console.log("");
+        console.log("Press Ctrl+C to stop the server");
+        console.log("============================================");
+    });
+}
+
+module.exports = app;
